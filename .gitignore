@@ -3,3 +3,4 @@ data/
 akshare_cache/
 __pychache__/
 *.log
+*.xlsx

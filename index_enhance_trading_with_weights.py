@@ -108,6 +108,7 @@ def getData():
         try:
             # 获取日K线数据
             logging.info(f"Fetching daily data for {symbol}")
+            time.sleep(1)
             stock_data = ak.stock_zh_a_daily(symbol=symbol, adjust="qfq", start_date=start_date, end_date=end_date)
             if stock_data.empty:
                 logging.warning(f"股票 {symbol} 日K线数据为空")
@@ -134,6 +135,7 @@ def getData():
             # 获取PE/PB数据
             symbol_code = symbol[2:]
             logging.info(f"Fetching PE/PB data for {symbol}")
+            time.sleep(1)
             pe_pb_data = ak.stock_a_indicator_lg(symbol=symbol_code)
             if pe_pb_data.empty:
                 logging.warning(f"股票 {symbol} PE/PB 数据为空")
@@ -144,6 +146,7 @@ def getData():
             
             # 获取财务数据
             logging.info(f"Fetching financial data for {symbol}")
+            time.sleep(1)
             financial_data = ak.stock_financial_analysis_indicator(symbol=symbol_code, start_year="2020")
             if financial_data.empty:
                 logging.warning(f"股票 {symbol} 财务数据为空")
@@ -253,7 +256,8 @@ def calculate_factors(symbol):
 
 # 并行计算因子
 logging.info("Calculating factors in parallel")
-all_factors_list = Parallel(n_jobs=-1, verbose=10)(delayed(calculate_factors)(symbol) for symbol in symbols)
+# all_factors_list = Parallel(n_jobs=-1, verbose=10)(delayed(calculate_factors)(symbol) for symbol in symbols)
+all_factors_list = [calculate_factors(symbol) for symbol in symbols]
 all_factors_list = [f for f in all_factors_list if not f.empty]
 if not all_factors_list:
     raise ValueError("所有股票因子数据为空")
