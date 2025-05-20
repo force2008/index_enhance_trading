@@ -32,6 +32,8 @@ logger.addHandler(file_handler)
 os.makedirs("data/daily/cleaned", exist_ok=True)
 os.makedirs("data/pe_pb/cleaned", exist_ok=True)
 os.makedirs("data/financial/cleaned", exist_ok=True)
+# Modified: Create data/factors directory
+os.makedirs("data/factors", exist_ok=True)
 
 # 数据层：获取中证500成分股和数据
 def get_stock_code(symbol, exchange):
@@ -106,7 +108,8 @@ def getData():
             os.path.exists(cleaned_financial_file) and os.path.getsize(cleaned_financial_file) > 0):
             try:
                 stock_data = pd.read_csv(cleaned_daily_file, parse_dates=['date'], index_col='date')
-                if not (stock_data['close'].isna().any() or (stock_data['close'] <= 0).any()):
+                # Modified: Stricter validation for close prices
+                if not (stock_data['close'].isna().any() or (stock_data['close'] <= 0).any() or stock_data['close'].lt(0).any()):
                     valid_symbols.append(symbol)
                     continue
             except Exception as e:
@@ -138,12 +141,17 @@ def getData():
             
             # 增强清洗
             stock_data['close'] = stock_data['close'].ffill().bfill()
-            if stock_data['close'].isna().any() or (stock_data['close'] <= 0).any():
+            # Modified: Stricter validation and logging
+            if stock_data['close'].isna().any() or (stock_data['close'] <= 0).any() or stock_data['close'].lt(0).any():
                 mean_close = stock_data['close'].mean()
                 if pd.isna(mean_close) or mean_close <= 0:
-                    logging.warning(f"股票 {symbol} 无法计算有效均价")
+                    logging.warning(f"股票 {symbol} 无法计算有效均价: mean={mean_close}")
                     continue
                 stock_data['close'] = stock_data['close'].fillna(mean_close)
+                # Check for negative close prices
+                if stock_data['close'].lt(0).any():
+                    logging.warning(f"股票 {symbol} 包含负收盘价: {stock_data[stock_data['close'] < 0]['close'].to_dict()}")
+                    continue
                 if stock_data['close'].isna().any() or (stock_data['close'] <= 0).any():
                     logging.warning(f"股票 {symbol} 日K线数据填充后仍无效")
                     continue
@@ -187,7 +195,8 @@ def getData():
             financial_data['主营业务收入增长率(%)'] = financial_data['主营业务收入增长率(%)'].fillna(financial_data['主营业务收入增长率(%)'].mean()).fillna(0)
             financial_data['资产负债率(%)'] = financial_data['资产负债率(%)'].fillna(financial_data['资产负债率(%)'].mean()).fillna(50)
 
-            if (stock_data['close'].isna().any() or (stock_data['close'] <= 0).any() or
+            # Modified: Final validation for negative close prices
+            if (stock_data['close'].isna().any() or (stock_data['close'] <= 0).any() or stock_data['close'].lt(0).any() or
                 pe_pb_data['pe'].isna().any() or pe_pb_data['pb'].isna().any() or
                 financial_data['净资产收益率(%)'].isna().any() or
                 financial_data['主营业务收入增长率(%)'].isna().any() or
@@ -227,7 +236,8 @@ def calculate_factors(symbol):
         pe_pb_data = pd.read_csv(f"data/pe_pb/cleaned/stock_{symbol}_pe_pb_cleaned.csv", parse_dates=['date'], index_col='date')
         financial_data = pd.read_csv(f"data/financial/cleaned/stock_{symbol}_financial_cleaned.csv", parse_dates=['date'], index_col='date')
         
-        if (stock_data['close'].isna().all() or (stock_data['close'] <= 0).all() or 
+        # Validate close prices
+        if (stock_data['close'].isna().all() or (stock_data['close'] <= 0).all() or stock_data['close'].lt(0).any() or
             'pe' not in pe_pb_data.columns or pe_pb_data['pe'].isna().all() or 
             'pb' not in pe_pb_data.columns or pe_pb_data['pb'].isna().all() or 
             '净资产收益率(%)' not in financial_data.columns or financial_data['净资产收益率(%)'].isna().all() or 
@@ -247,7 +257,11 @@ def calculate_factors(symbol):
         
         factors['short_momentum'] = stock_data['close'].pct_change(20).fillna(0)
         factors['reversal'] = -stock_data['close'].pct_change(5).fillna(0)
-        factors['volatility'] = stock_data['close'].pct_change().rolling(60).std().fillna(0)
+        factors['raw_volatility'] = stock_data['close'].pct_change().rolling(20, min_periods=10).std().fillna(0.1)
+        if (factors['raw_volatility'] < 0).any():
+            logging.error(f"股票 {symbol} 包含负原始波动率: {factors[factors['raw_volatility'] < 0]['raw_volatility'].to_dict()}")
+            return pd.DataFrame()
+        factors['volatility'] = factors['raw_volatility']  # Will be normalized later
         factors['rsi'] = pd.Series(talib.RSI(stock_data['close'], timeperiod=14), index=stock_data.index).fillna(50)
         factors['low_vol'] = -factors['volatility']
         
@@ -269,6 +283,12 @@ def calculate_factors(symbol):
         factors['score'] = factors['score'].where(factors['volatility'] < factors['volatility'].quantile(0.75), np.nan)
         factors['symbol'] = symbol
         
+        # Modified: Save factors to data/factors/stock_{symbol}_factors.csv
+        factors_file = f"data/factors/stock_{symbol}_factors.csv"
+        factors.index.name = 'date'
+        factors.to_csv(factors_file, encoding='utf-8')
+        logging.info(f"Saved factors for {symbol} to {factors_file}, rows: {len(factors)}")
+        
         return factors
     except Exception as e:
         logging.error(f"股票 {symbol} 因子计算失败: {str(e)}")
@@ -277,7 +297,6 @@ def calculate_factors(symbol):
 # 并行计算因子
 logging.info("Calculating factors in parallel")
 all_factors_list = Parallel(n_jobs=-1, verbose=10)(delayed(calculate_factors)(symbol) for symbol in symbols)
-# all_factors_list = [calculate_factors(symbol) for symbol in symbols]
 all_factors_list = [f for f in all_factors_list if not f.empty]
 if not all_factors_list:
     raise ValueError("所有股票因子数据为空")
@@ -310,14 +329,12 @@ def select_stocks(factors, rebalance_date, index_weights, alpha=0.5):
         factor_weights = {stock: 1.0/num_stocks for stock in selected}
         volatilities = {}
         for stock in selected:
-            symbol_data = pd.read_csv(f"data/daily/cleaned/stock_{stock}_cleaned.csv", parse_dates=['date'], index_col='date')
-            window = symbol_data['close'][:rebalance_date].tail(20)
-            vol = window.pct_change().std()
-            if len(window) >= 10 and not pd.isna(vol) and vol > 0:
+            vol = factors[factors['symbol'] == stock]['raw_volatility'].iloc[0]
+            if not pd.isna(vol) and vol > 0:
                 volatilities[stock] = vol
             else:
                 volatilities[stock] = 0.1
-                logging.warning(f"Invalid volatility for {stock} at {rebalance_date}: len={len(window)}, vol={vol}, using default 0.1")
+                logging.warning(f"Invalid volatility for {stock} at {rebalance_date}: vol={vol}, using default 0.1")
         
         final_weights = {}
         total_weight = 0
