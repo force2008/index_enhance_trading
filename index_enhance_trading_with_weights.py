@@ -276,8 +276,7 @@ def calculate_factors(symbol):
             -factors['pe'] - factors['pb'] +
             factors['roe'] + factors['revenue_growth'] -
             factors['debt_ratio'] +
-            0.5 * factors['short_momentum'] + 0.5 * factors['reversal'] -
-            factors['volatility'] - factors['rsi'] +
+            0.5 * factors['short_momentum'] + 0.5 * factors['reversal']  - factors['rsi'] +
             factors['low_vol']
         )
         factors['score'] = factors['score'].where(factors['volatility'] < factors['volatility'].quantile(0.75), np.nan)
@@ -320,7 +319,7 @@ def select_stocks(factors, rebalance_date, index_weights, alpha=0.5):
             return {}
         
         factors = factors.sort_values('score', ascending=False)
-        num_stocks = min(100, len(factors))
+        num_stocks = min(300, len(factors))
         selected = factors.head(num_stocks)['symbol'].tolist()
         
         index_weights = index_weights[index_weights['日期'] <= rebalance_date].tail(1)
@@ -358,7 +357,7 @@ def select_stocks(factors, rebalance_date, index_weights, alpha=0.5):
 # 指数增强策略
 class IndexEnhanceStrategy(bt.Strategy):
     params = (
-        ('alpha', 0.5),
+        ('alpha', 0.7),
         ('stop_loss_stock', 0.10),
         ('stop_loss_portfolio', 0.20),
     )
