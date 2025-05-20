@@ -67,7 +67,7 @@ def getData():
     logging.info(f"CSI 500 constituents saved, rows: {len(csi500_constituents)}")
     time.sleep(2)
     
-    symbols = csi500_constituents['stock_code'].unique().tolist()[:12]
+    symbols = csi500_constituents['stock_code'].unique().tolist()
     logging.info(f"Total unique symbols: {len(symbols)}")
     
     # 获取指数数据
