@@ -276,8 +276,8 @@ def calculate_factors(symbol):
 
 # 并行计算因子
 logging.info("Calculating factors in parallel")
-# all_factors_list = Parallel(n_jobs=-1, verbose=10)(delayed(calculate_factors)(symbol) for symbol in symbols)
-all_factors_list = [calculate_factors(symbol) for symbol in symbols]
+all_factors_list = Parallel(n_jobs=-1, verbose=10)(delayed(calculate_factors)(symbol) for symbol in symbols)
+# all_factors_list = [calculate_factors(symbol) for symbol in symbols]
 all_factors_list = [f for f in all_factors_list if not f.empty]
 if not all_factors_list:
     raise ValueError("所有股票因子数据为空")
@@ -312,7 +312,12 @@ def select_stocks(factors, rebalance_date, index_weights, alpha=0.5):
         for stock in selected:
             symbol_data = pd.read_csv(f"data/daily/cleaned/stock_{stock}_cleaned.csv", parse_dates=['date'], index_col='date')
             window = symbol_data['close'][:rebalance_date].tail(20)
-            volatilities[stock] = window.pct_change().std() if len(window) >= 10 else 0.1
+            vol = window.pct_change().std()
+            if len(window) >= 10 and not pd.isna(vol) and vol > 0:
+                volatilities[stock] = vol
+            else:
+                volatilities[stock] = 0.1
+                logging.warning(f"Invalid volatility for {stock} at {rebalance_date}: len={len(window)}, vol={vol}, using default 0.1")
         
         final_weights = {}
         total_weight = 0
