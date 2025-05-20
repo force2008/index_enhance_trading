@@ -29,9 +29,9 @@ file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
 # 创建目录
-os.makedirs("data01/daily/cleaned", exist_ok=True)
-os.makedirs("data01/pe_pb/cleaned", exist_ok=True)
-os.makedirs("data01/financial/cleaned", exist_ok=True)
+os.makedirs("data/daily/cleaned", exist_ok=True)
+os.makedirs("data/pe_pb/cleaned", exist_ok=True)
+os.makedirs("data/financial/cleaned", exist_ok=True)
 
 # 数据层：获取中证500成分股和数据
 def get_stock_code(symbol, exchange):
@@ -47,7 +47,7 @@ def getData():
     end_date = "20221230"
     
     # 检查缓存
-    cache_file = "data01/csi500_data_cache.pkl"
+    cache_file = "data/csi500_data_cache.pkl"
     if os.path.exists(cache_file):
         logging.info("Loading cached CSI 500 data")
         cached_data = pd.read_pickle(cache_file)
@@ -56,23 +56,26 @@ def getData():
     # 获取中证500成分股
     logging.info("Fetching CSI 500 constituents")
     csi500_constituents = ak.index_stock_cons_weight_csindex(symbol="000905")
+    if csi500_constituents is None or csi500_constituents.empty:
+        logging.error("CSI 500 constituents data is empty or None")
+        raise ValueError("CSI 500 constituents data is empty or None")
     csi500_constituents['stock_code'] = csi500_constituents.apply(
         lambda x: get_stock_code(x['成分券代码'], x['交易所']), axis=1
     )
     csi500_constituents['日期'] = pd.to_datetime(csi500_constituents['日期'])
-    csi500_constituents.to_csv("data01/csi500_weights.csv", encoding='utf-8')
+    csi500_constituents.to_csv("data/csi500_weights.csv", encoding='utf-8')
     logging.info(f"CSI 500 constituents saved, rows: {len(csi500_constituents)}")
     time.sleep(2)
     
-    symbols = csi500_constituents['stock_code'].unique().tolist()
+    symbols = csi500_constituents['stock_code'].unique().tolist()[:12]
     logging.info(f"Total unique symbols: {len(symbols)}")
     
     # 获取指数数据
     logging.info("Fetching CSI 500 index data")
     index_data = ak.index_zh_a_hist(symbol="000905", period="daily", start_date=start_date, end_date=end_date)
-    if index_data.empty:
-        logging.error("Index data is empty")
-        raise ValueError("Index data is empty")
+    if index_data is None or index_data.empty:
+        logging.error("Index data is empty or None")
+        raise ValueError("Index data is empty or None")
     index_data['date'] = pd.to_datetime(index_data['日期'])
     index_data = index_data.rename(columns={
         '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low', '成交量': 'volume'
@@ -87,31 +90,44 @@ def getData():
     if index_data['close'].isna().any() or (index_data['close'] <= 0).any():
         logging.error(f"Index data contains invalid close prices: NaN={index_data['close'].isna().sum()}, Zero={(index_data['close'] <= 0).sum()}")
         raise ValueError("Index data contains invalid close prices")
-    index_data.to_csv("data01/csi500_index.csv", encoding='utf-8')
+    index_data.index.name = 'date'
+    index_data.to_csv("data/csi500_index.csv", encoding='utf-8')
     logging.info(f"Index data saved, rows: {len(index_data)}")
     time.sleep(2)
 
     valid_symbols = []
     for symbol in tqdm(symbols, desc="Processing stocks", unit="stock"):
-        cleaned_daily_file = f"data01/daily/cleaned/stock_{symbol}_cleaned.csv"
-        cleaned_pe_pb_file = f"data01/pe_pb/cleaned/stock_{symbol}_pe_pb_cleaned.csv"
-        cleaned_financial_file = f"data01/financial/cleaned/stock_{symbol}_financial_cleaned.csv"
+        cleaned_daily_file = f"data/daily/cleaned/stock_{symbol}_cleaned.csv"
+        cleaned_pe_pb_file = f"data/pe_pb/cleaned/stock_{symbol}_pe_pb_cleaned.csv"
+        cleaned_financial_file = f"data/financial/cleaned/stock_{symbol}_financial_cleaned.csv"
 
         if (os.path.exists(cleaned_daily_file) and os.path.getsize(cleaned_daily_file) > 0 and
             os.path.exists(cleaned_pe_pb_file) and os.path.getsize(cleaned_pe_pb_file) > 0 and
             os.path.exists(cleaned_financial_file) and os.path.getsize(cleaned_financial_file) > 0):
-            stock_data = pd.read_csv(cleaned_daily_file, parse_dates=['date'], index_col='date')
-            if not (stock_data['close'].isna().any() or (stock_data['close'] <= 0).any()):
-                valid_symbols.append(symbol)
+            try:
+                stock_data = pd.read_csv(cleaned_daily_file, parse_dates=['date'], index_col='date')
+                if not (stock_data['close'].isna().any() or (stock_data['close'] <= 0).any()):
+                    valid_symbols.append(symbol)
+                    continue
+            except Exception as e:
+                logging.warning(f"股票 {symbol} 读取现有CSV失败: {str(e)}, 将重新生成")
+                # Proceed to regenerate the CSV
+
+        symbol_code = symbol[2:]
+        try:
+            # 检查股票有效性
+            logging.info(f"Checking validity of stock {symbol}")
+            stock_info = ak.stock_individual_info_em(symbol=symbol_code)
+            if stock_info is None or stock_info.empty:
+                logging.warning(f"股票 {symbol} 无有效信息，可能已退市或数据不可用")
                 continue
 
-        try:
             # 获取日K线数据
             logging.info(f"Fetching daily data for {symbol}")
             time.sleep(1)
             stock_data = ak.stock_zh_a_daily(symbol=symbol, adjust="qfq", start_date=start_date, end_date=end_date)
-            if stock_data.empty:
-                logging.warning(f"股票 {symbol} 日K线数据为空")
+            if stock_data is None or stock_data.empty:
+                logging.warning(f"股票 {symbol} 日K线数据为空或返回 None")
                 continue
             stock_data['date'] = pd.to_datetime(stock_data['date'])
             stock_data = stock_data.rename(columns={
@@ -133,12 +149,11 @@ def getData():
                     continue
 
             # 获取PE/PB数据
-            symbol_code = symbol[2:]
             logging.info(f"Fetching PE/PB data for {symbol}")
             time.sleep(1)
             pe_pb_data = ak.stock_a_indicator_lg(symbol=symbol_code)
-            if pe_pb_data.empty:
-                logging.warning(f"股票 {symbol} PE/PB 数据为空")
+            if pe_pb_data is None or pe_pb_data.empty:
+                logging.warning(f"股票 {symbol} PE/PB 数据为空或返回 None")
                 continue
             pe_pb_data['date'] = pd.to_datetime(pe_pb_data['trade_date'])
             pe_pb_data.set_index('date', inplace=True)
@@ -148,8 +163,8 @@ def getData():
             logging.info(f"Fetching financial data for {symbol}")
             time.sleep(1)
             financial_data = ak.stock_financial_analysis_indicator(symbol=symbol_code, start_year="2020")
-            if financial_data.empty:
-                logging.warning(f"股票 {symbol} 财务数据为空")
+            if financial_data is None or financial_data.empty:
+                logging.warning(f"股票 {symbol} 财务数据为空或返回 None")
                 continue
             financial_data['date'] = pd.to_datetime(financial_data['日期'])
             financial_data.set_index('date', inplace=True)
@@ -180,6 +195,11 @@ def getData():
                 logging.warning(f"股票 {symbol} 清洗后数据仍包含无效值")
                 continue
 
+            # Set index name to ensure 'date' column in CSV
+            stock_data.index.name = 'date'
+            pe_pb_data.index.name = 'date'
+            financial_data.index.name = 'date'
+
             stock_data.to_csv(cleaned_daily_file, encoding='utf-8')
             pe_pb_data.to_csv(cleaned_pe_pb_file, encoding='utf-8')
             financial_data.to_csv(cleaned_financial_file, encoding='utf-8')
@@ -203,9 +223,9 @@ column_mapping = {
 
 def calculate_factors(symbol):
     try:
-        stock_data = pd.read_csv(f"data01/daily/cleaned/stock_{symbol}_cleaned.csv", parse_dates=['date'], index_col='date')
-        pe_pb_data = pd.read_csv(f"data01/pe_pb/cleaned/stock_{symbol}_pe_pb_cleaned.csv", parse_dates=['date'], index_col='date')
-        financial_data = pd.read_csv(f"data01/financial/cleaned/stock_{symbol}_financial_cleaned.csv", parse_dates=['date'], index_col='date')
+        stock_data = pd.read_csv(f"data/daily/cleaned/stock_{symbol}_cleaned.csv", parse_dates=['date'], index_col='date')
+        pe_pb_data = pd.read_csv(f"data/pe_pb/cleaned/stock_{symbol}_pe_pb_cleaned.csv", parse_dates=['date'], index_col='date')
+        financial_data = pd.read_csv(f"data/financial/cleaned/stock_{symbol}_financial_cleaned.csv", parse_dates=['date'], index_col='date')
         
         if (stock_data['close'].isna().all() or (stock_data['close'] <= 0).all() or 
             'pe' not in pe_pb_data.columns or pe_pb_data['pe'].isna().all() or 
@@ -262,7 +282,7 @@ all_factors_list = [f for f in all_factors_list if not f.empty]
 if not all_factors_list:
     raise ValueError("所有股票因子数据为空")
 all_factors = pd.concat(all_factors_list, axis=0)
-all_factors.to_csv("data01/all_factors.csv", encoding='utf-8')
+all_factors.to_csv("data/all_factors.csv", encoding='utf-8')
 logging.info(f"All factors saved, rows: {len(all_factors)}")
 
 # 选股函数
@@ -290,7 +310,7 @@ def select_stocks(factors, rebalance_date, index_weights, alpha=0.5):
         factor_weights = {stock: 1.0/num_stocks for stock in selected}
         volatilities = {}
         for stock in selected:
-            symbol_data = pd.read_csv(f"data01/daily/cleaned/stock_{stock}_cleaned.csv", parse_dates=['date'], index_col='date')
+            symbol_data = pd.read_csv(f"data/daily/cleaned/stock_{stock}_cleaned.csv", parse_dates=['date'], index_col='date')
             window = symbol_data['close'][:rebalance_date].tail(20)
             volatilities[stock] = window.pct_change().std() if len(window) >= 10 else 0.1
         
@@ -323,8 +343,8 @@ class IndexEnhanceStrategy(bt.Strategy):
 
     def __init__(self):
         logging.info("Initializing IndexEnhanceStrategy")
-        self.all_factors = pd.read_csv("data01/all_factors.csv", parse_dates=['date'], index_col='date')
-        self.index_weights = pd.read_csv("data01/csi500_weights.csv", parse_dates=['日期'])
+        self.all_factors = pd.read_csv("data/all_factors.csv", parse_dates=['date'], index_col='date')
+        self.index_weights = pd.read_csv("data/csi500_weights.csv", parse_dates=['日期'])
         self.weights = {}
         self.prev_weights = {}
         self.portfolio_values = []
@@ -387,7 +407,7 @@ class IndexEnhanceStrategy(bt.Strategy):
 
 # 回测
 cerebro = bt.Cerebro(stdstats=False)
-index_data = pd.read_csv("data01/csi500_index.csv", parse_dates=['date'], index_col='date')
+index_data = pd.read_csv("data/csi500_index.csv", parse_dates=['date'], index_col='date')
 if index_data.empty or 'close' not in index_data.columns or index_data['close'].isna().any() or (index_data['close'] <= 0).any():
     logging.error("Invalid index data")
     raise ValueError("Invalid index data")
@@ -408,7 +428,7 @@ cerebro.adddata(bt.feeds.PandasData(
 data_feed_count = 1
 for symbol in symbols:
     try:
-        data = pd.read_csv(f"data01/daily/cleaned/stock_{symbol}_cleaned.csv", parse_dates=['date'], index_col='date')
+        data = pd.read_csv(f"data/daily/cleaned/stock_{symbol}_cleaned.csv", parse_dates=['date'], index_col='date')
         if data.empty or 'close' not in data.columns or data['close'].isna().any() or (data['close'] <= 0).any():
             logging.warning(f"Skipping {symbol} due to invalid data")
             continue
