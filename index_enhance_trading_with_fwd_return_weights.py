@@ -2,6 +2,7 @@ import akshare as ak
 import pandas as pd
 import backtrader as bt
 import logging
+from scipy.stats import spearmanr
 import numpy as np
 import talib
 import os
@@ -208,6 +209,7 @@ def calculate_factors(symbol):
             '净资产收益率(%)' not in financial_data.columns or financial_data['净资产收益率(%)'].isna().all() or 
             '主营业务收入增长率(%)' not in financial_data.columns or financial_data['主营业务收入增长率(%)'].isna().all() or
             '资产负债率(%)' not in financial_data.columns or financial_data['资产负债率(%)'].isna().all()):
+            logging.warning(f"股票 {symbol} 数据不完整")
             return pd.DataFrame()
         
         factors = pd.DataFrame(index=stock_data.index)
@@ -223,46 +225,78 @@ def calculate_factors(symbol):
         factors['reversal'] = -stock_data['close'].pct_change(5).fillna(0)
         factors['raw_volatility'] = stock_data['close'].pct_change().rolling(20, min_periods=10).std().fillna(0.1)
         if (factors['raw_volatility'] < 0).any():
+            logging.error(f"股票 {symbol} 包含负原始波动率")
             return pd.DataFrame()
         factors['volatility'] = factors['raw_volatility']
         factors['rsi'] = pd.Series(talib.RSI(stock_data['close'], timeperiod=14), index=stock_data.index).fillna(50)
         factors['low_vol'] = -factors['volatility']
         
+        # 标准化因子
         factor_columns = ['pe', 'pb', 'roe', 'revenue_growth', 'debt_ratio', 
-                         'short_momentum', 'reversal', 'volatility', 'rsi', 'low_vol']
+                         'short_momentum', 'reversal', 'rsi', 'low_vol']
         for col in factor_columns:
             mean = factors[col].mean()
             std = factors[col].std()
             factors[col] = factors[col] - mean if pd.isna(std) or std == 0 else (factors[col] - mean) / std
         
-        factors['score'] = (
-            -factors['pe'] - factors['pb'] +
-            factors['roe'] + factors['revenue_growth'] -
-            factors['debt_ratio'] +
-            0.5 * factors['short_momentum'] + 0.5 * factors['reversal'] - factors['rsi'] +
-            factors['low_vol']
-        )
+        # 计算未来20天收益，改进填充
+        factors['fwd_return'] = stock_data['close'].pct_change(20).shift(-20)
+        mean_return = factors['fwd_return'].mean()
+        factors['fwd_return'] = factors['fwd_return'].fillna(mean_return if not pd.isna(mean_return) else 0)
+        
+        # 计算 IC 权重（每季度更新）
+        ic_weights_file = f"data/factors/ic_weights_{symbol}.csv"
+        if os.path.exists(ic_weights_file):
+            ic_weights = pd.read_csv(ic_weights_file, index_col='date', parse_dates=True)
+        else:
+            ic_weights = pd.DataFrame(index=factors.index, columns=factor_columns)
+            rolling_window = 60  # 约一季度
+            for t in factors.index:
+                window = factors.loc[:t].tail(rolling_window)
+                min_window = max(20, len(window))  # 动态窗口，早期数据不足时使用可用数据
+                window = factors.loc[:t].tail(min_window)
+                if len(window) < 10:  # 最少10条数据
+                    ic_weights.loc[t] = [0] * len(factor_columns)
+                    continue
+                ics = []
+                for col in factor_columns:
+                    x = window[col].dropna()
+                    y = window['fwd_return'].dropna()
+                    if len(x) < 10 or len(y) < 10 or x.nunique() <= 1 or y.nunique() <= 1:
+                        ics.append(0)  # 常量或数据不足，返回 IC=0
+                        logging.debug(f"股票 {symbol} 因子 {col} 在 {t} 窗口常量或数据不足")
+                        continue
+                    ic, _ = spearmanr(x, y, nan_policy='omit')
+                    ics.append(ic if not np.isnan(ic) else 0)
+                # 归一化 IC，保持正负方向
+                ic_sum = sum(abs(ic) for ic in ics)
+                weights = [ic / ic_sum if ic_sum > 0 else 0 for ic in ics]
+                ic_weights.loc[t] = weights
+            ic_weights.to_csv(ic_weights_file)
+        
+        # 应用 IC 权重计算 score
+        factors['score'] = 0
+        for col, weight in zip(factor_columns, ic_weights.iloc[-1]):
+            factors['score'] += factors[col] * weight
+        
+        # 波动率过滤（保持原逻辑）
         factors['score'] = factors['score'].where(factors['volatility'] < factors['volatility'].quantile(0.75), np.nan)
         factors['symbol'] = symbol
         
         return factors
     except Exception as e:
+        logging.error(f"股票 {symbol} 因子计算失败: {str(e)}")
         return pd.DataFrame()
 
-# 检查因子缓存
-all_factors_file = "data/all_factors.csv"
-if os.path.exists(all_factors_file) and os.path.getsize(all_factors_file) > 0:
-    logging.info("Loading cached all_factors.csv")
-    all_factors = pd.read_csv(all_factors_file, parse_dates=['date'], index_col='date')
-else:
-    logging.info("Calculating factors in parallel")
-    all_factors_list = Parallel(n_jobs=4, verbose=5)(delayed(calculate_factors)(symbol) for symbol in symbols)
-    all_factors_list = [f for f in all_factors_list if not f.empty]
-    if not all_factors_list:
-        raise ValueError("所有股票因子数据为空")
-    all_factors = pd.concat(all_factors_list, axis=0)
-    all_factors.to_csv(all_factors_file, encoding='utf-8')
-
+# 主程序修改（替换原并行计算部分）
+logging.info("Calculating factors in parallel")
+all_factors_list = Parallel(n_jobs=4, verbose=5)(delayed(calculate_factors)(symbol) for symbol in symbols)
+all_factors_list = [f for f in all_factors_list if not f.empty]
+if not all_factors_list:
+    raise ValueError("所有股票因子数据为空")
+all_factors = pd.concat(all_factors_list, axis=0)
+all_factors.to_csv("data/all_factors.csv", encoding='utf-8')
+logging.info(f"All factors saved, rows: {len(all_factors)}")
 # 选股函数
 def select_stocks(factors_dict, rebalance_date, index_weights, alpha=0.5):
     try:

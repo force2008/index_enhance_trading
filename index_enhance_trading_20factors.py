@@ -12,8 +12,9 @@ from joblib import Parallel, delayed
 import openpyxl
 from openpyxl.styles import numbers
 import plotly.graph_objects as go
+import statsmodels.api as sm
 
-# 设置日志，减少非必要日志
+# 设置日志
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -31,6 +32,7 @@ logger.addHandler(file_handler)
 os.makedirs("data/daily/cleaned", exist_ok=True)
 os.makedirs("data/pe_pb/cleaned", exist_ok=True)
 os.makedirs("data/financial/cleaned", exist_ok=True)
+os.makedirs("data/dividend/cleaned", exist_ok=True)
 
 # 数据层：获取中证500成分股和数据
 def get_stock_code(symbol, exchange):
@@ -63,7 +65,7 @@ def getData():
     csi500_constituents.to_csv("data/csi500_weights.csv", encoding='utf-8')
     time.sleep(2)
     
-    symbols = csi500_constituents['stock_code'].unique().tolist()
+    symbols = csi500_constituents['stock_code'].unique().tolist()[:20]
     
     # 获取指数数据
     index_data = ak.index_zh_a_hist(symbol="000905", period="daily", start_date=start_date, end_date=end_date)
@@ -96,10 +98,12 @@ def getData():
             cleaned_daily_file = f"data/daily/cleaned/stock_{symbol}_cleaned.csv"
             cleaned_pe_pb_file = f"data/pe_pb/cleaned/stock_{symbol}_pe_pb_cleaned.csv"
             cleaned_financial_file = f"data/financial/cleaned/stock_{symbol}_financial_cleaned.csv"
+            cleaned_dividend_file = f"data/dividend/cleaned/stock_{symbol}_dividend_cleaned.csv"
 
             if (os.path.exists(cleaned_daily_file) and os.path.getsize(cleaned_daily_file) > 0 and
                 os.path.exists(cleaned_pe_pb_file) and os.path.getsize(cleaned_pe_pb_file) > 0 and
-                os.path.exists(cleaned_financial_file) and os.path.getsize(cleaned_financial_file) > 0):
+                os.path.exists(cleaned_financial_file) and os.path.getsize(cleaned_financial_file) > 0 and
+                os.path.exists(cleaned_dividend_file) and os.path.getsize(cleaned_dividend_file) > 0):
                 try:
                     stock_data = pd.read_csv(cleaned_daily_file, parse_dates=['date'], index_col='date')
                     if not (stock_data['close'].isna().any() or (stock_data['close'] <= 0).any() or stock_data['close'].lt(0).any()):
@@ -111,10 +115,13 @@ def getData():
 
             symbol_code = symbol[2:]
             try:
+                time.sleep(1)
                 stock_info = ak.stock_individual_info_em(symbol=symbol_code)
                 if stock_info is None or stock_info.empty:
                     continue
 
+                # 日K线数据
+                time.sleep(1)
                 stock_data = ak.stock_zh_a_daily(symbol=symbol, adjust="qfq", start_date=start_date, end_date=end_date)
                 if stock_data is None or stock_data.empty:
                     continue
@@ -134,6 +141,8 @@ def getData():
                     if stock_data['close'].lt(0).any():
                         continue
 
+                # PE/PB 数据
+                time.sleep(1)
                 pe_pb_data = ak.stock_a_indicator_lg(symbol=symbol_code)
                 if pe_pb_data is None or pe_pb_data.empty:
                     continue
@@ -141,6 +150,8 @@ def getData():
                 pe_pb_data.set_index('date', inplace=True)
                 pe_pb_data = pe_pb_data[(pe_pb_data.index >= pd.to_datetime(start_date)) & (pe_pb_data.index <= pd.to_datetime(end_date))]
                 
+                # 财务数据
+                time.sleep(1)
                 financial_data = ak.stock_financial_analysis_indicator(symbol=symbol_code, start_year="2020")
                 if financial_data is None or financial_data.empty:
                     continue
@@ -148,10 +159,68 @@ def getData():
                 financial_data.set_index('date', inplace=True)
                 financial_data = financial_data[(financial_data.index >= pd.to_datetime(start_date)) & (financial_data.index <= pd.to_datetime(end_date))]
                 
+                # 股息率数据
+                try:
+                    time.sleep(1)
+                    dividend_data = ak.stock_dividend_cninfo(symbol=symbol_code)
+                    if dividend_data is None or dividend_data.empty:
+                        dividend_data = pd.DataFrame({'股权登记日': [], '分红类型': [], '除权日': []})
+                    dividend_data['date'] = pd.to_datetime(dividend_data['股权登记日'])
+                    dividend_data = dividend_data[dividend_data['date'].notna()]
+                    dividend_data.set_index('date', inplace=True)
+                    dividend_data = dividend_data[(dividend_data.index >= pd.to_datetime(start_date)) & (dividend_data.index <= pd.to_datetime(end_date))]
+
+                    # 计算每股股息（解析分红方案，如“10 派 2 元”）
+                    def parse_dividend_scheme(scheme):
+                        if pd.isna(scheme) or not isinstance(scheme, str):
+                            return 0
+                        match = re.search(r'10\s*派\s*(\d+\.?\d*)', scheme)
+                        if match:
+                            cash = float(match.group(1))
+                            return cash / 10  # 每股股息（10 股派 X 元）
+                        return 0
+
+                    dividend_data['per_share_dividend'] = dividend_data['派息比例']/10
+                    
+                    # 计算年化股息（假设每年分红一次）
+                    dividend_data = dividend_data.groupby(dividend_data.index.to_period('Y')).agg({
+                        'per_share_dividend': 'sum'
+                    }).reset_index()
+                    dividend_data['date'] = dividend_data['index'].apply(lambda x: x.to_timestamp(how='end'))
+                    dividend_data.set_index('date', inplace=True)
+                    dividend_data.drop(columns=['index'], inplace=True)
+                    
+                    # 匹配股价计算股息率
+                    dividend_data = dividend_data.join(stock_data['close'], how='left')
+                    dividend_data['dividend_yield'] = dividend_data['per_share_dividend'] / dividend_data['close'].replace(0, np.nan)
+                    dividend_data['dividend_yield'] = dividend_data['dividend_yield'].replace([np.inf, -np.inf], 0).clip(lower=0)
+                except Exception as e:
+                    logging.warning(f"股票 {symbol} 股息率数据获取失败: {str(e)}")
+                    dividend_data = pd.DataFrame(index=pd.date_range(start=start_date, end=end_date, freq='D'), columns=['dividend_yield'])
+                    dividend_data['dividend_yield'] = 0
+                
+                # 经营现金流数据
+                cash_flow_data = ak.stock_financial_report_sina(stock=symbol_code, symbol="cash_flow")
+                if cash_flow_data is None or cash_flow_data.empty:
+                    cash_flow_data = pd.DataFrame({'报告期': [], '经营活动产生的现金流量净额': [], '资产总计': []})
+                cash_flow_data['date'] = pd.to_datetime(cash_flow_data['报告期'])
+                cash_flow_data.set_index('date', inplace=True)
+                cash_flow_data = cash_flow_data[(cash_flow_data.index >= pd.to_datetime(start_date)) & (cash_flow_data.index <= pd.to_datetime(end_date))]
+                # 合并财务和现金流数据
+
+                # 确保所需字段
+                required_cols = ['净资产收益率(%)', '主营业务收入增长率(%)', '资产负债率(%)',
+                                '净利润同比增长(%)', '总资产增长率(%)', '销售毛利率(%)',
+                                '流动资产周转率(次)', '资产的经营现金流量回报率(%)']
+                for col in required_cols:
+                    if col not in financial_data.columns:
+                        financial_data[col] = 0
+                
                 base_index = pd.date_range(start=start_date, end=end_date, freq='D')
                 stock_data = stock_data.reindex(base_index).ffill().bfill()
                 pe_pb_data = pe_pb_data.reindex(base_index).ffill().bfill()
                 financial_data = financial_data.reindex(base_index).ffill().bfill()
+                dividend_data = dividend_data.reindex(base_index).ffill().bfill()
 
                 stock_data['volume'] = stock_data['volume'].fillna(0)
                 stock_data['close'] = stock_data['close'].fillna(stock_data['close'].mean())
@@ -162,22 +231,36 @@ def getData():
                 pe_pb_data['pb'] = pe_pb_data['pb'].fillna(pe_pb_data['pb'].mean()).fillna(2)
                 financial_data['净资产收益率(%)'] = financial_data['净资产收益率(%)'].fillna(financial_data['净资产收益率(%)'].mean()).fillna(0)
                 financial_data['主营业务收入增长率(%)'] = financial_data['主营业务收入增长率(%)'].fillna(financial_data['主营业务收入增长率(%)'].mean()).fillna(0)
-                financial_data['资产负债率(%)'] = financial_data['资产负债率(%)'].fillna(financial_data['资产负债率(%)'].mean()).fillna(50)
+                financial_data['资产负债率(%)'] = financial_data['资产负债率(%)'].fillna(financial_data['资产负债率(%)'].mean()).fillna(0)
+                financial_data['净利润同比增长(%)'] = financial_data['净利润同比增长(%)'].fillna(financial_data['净利润同比增长(%)'].mean()).fillna(0)
+                financial_data['总资产增长率(%)'] = financial_data['总资产增长率(%)'].fillna(financial_data['总资产增长率(%)'].mean()).fillna(0)
+                financial_data['销售毛利率(%)'] = financial_data['销售毛利率(%)'].fillna(financial_data['销售毛利率(%)'].mean()).fillna(0)
+                financial_data['流动资产周转率(次)'] = financial_data['流动资产周转率(次)'].fillna(financial_data['流动资产周转率(次)'].mean()).fillna(0)
+                financial_data['资产的经营现金流量回报率(%)'] = financial_data['资产的经营现金流量回报率(%)'].fillna(financial_data['资产的经营现金流量回报率(%)'].mean()).fillna(0)
+                dividend_data['dividend_yield'] = dividend_data['dividend_yield'].fillna(0)
 
                 if (stock_data['close'].isna().any() or (stock_data['close'] <= 0).any() or stock_data['close'].lt(0).any() or
                     pe_pb_data['pe'].isna().any() or pe_pb_data['pb'].isna().any() or
                     financial_data['净资产收益率(%)'].isna().any() or
                     financial_data['主营业务收入增长率(%)'].isna().any() or
-                    financial_data['资产负债率(%)'].isna().any()):
+                    financial_data['资产负债率(%)'].isna().any() or
+                    financial_data['净利润同比增长(%)'].isna().any() or
+                    financial_data['总资产增长率(%)'].isna().any() or
+                    financial_data['销售毛利率(%)'].isna().any() or
+                    financial_data['流动资产周转率(次)'].isna().any() or
+                    financial_data['资产的经营现金流量回报率(%)'].isna().any() or
+                    financial_data['dividend_yield'].isna().any() ):
                     continue
 
                 stock_data.index.name = 'date'
                 pe_pb_data.index.name = 'date'
                 financial_data.index.name = 'date'
+                dividend_data.index.name = 'date'
 
                 stock_data.to_csv(cleaned_daily_file, encoding='utf-8')
                 pe_pb_data.to_csv(cleaned_pe_pb_file, encoding='utf-8')
                 financial_data.to_csv(cleaned_financial_file, encoding='utf-8')
+                dividend_data.to_csv(cleaned_dividend_file, encoding='utf-8')
                 store[f'stock_{symbol}'] = stock_data
                 valid_symbols.append(symbol)
             except Exception as e:
@@ -194,59 +277,125 @@ column_mapping = {
     "净资产收益率(%)": "roe",
     "主营业务收入增长率(%)": "revenue_growth",
     "资产负债率(%)": "debt_ratio",
+    "净利润同比增长(%)": "net_profit_growth",
+    "总资产增长率(%)": "asset_growth",
+    "销售毛利率(%)": "gross_margin",
+    "流动资产周转率(次)": "wc_turnover",
 }
 
 def calculate_factors(symbol):
     try:
+        # 加载数据
         stock_data = pd.read_csv(f"data/daily/cleaned/stock_{symbol}_cleaned.csv", parse_dates=['date'], index_col='date')
         pe_pb_data = pd.read_csv(f"data/pe_pb/cleaned/stock_{symbol}_pe_pb_cleaned.csv", parse_dates=['date'], index_col='date')
         financial_data = pd.read_csv(f"data/financial/cleaned/stock_{symbol}_financial_cleaned.csv", parse_dates=['date'], index_col='date')
-        
+        dividend_data = pd.read_csv(f"data/dividend/cleaned/stock_{symbol}_dividend_cleaned.csv", parse_dates=['date'], index_col='date')
+        index_data = pd.read_csv("data/csi500_index.csv", parse_dates=['date'], index_col='date')
+
+        # 数据完整性检查
         if (stock_data['close'].isna().all() or (stock_data['close'] <= 0).all() or stock_data['close'].lt(0).any() or
-            'pe' not in pe_pb_data.columns or pe_pb_data['pe'].isna().all() or 
-            'pb' not in pe_pb_data.columns or pe_pb_data['pb'].isna().all() or 
-            '净资产收益率(%)' not in financial_data.columns or financial_data['净资产收益率(%)'].isna().all() or 
-            '主营业务收入增长率(%)' not in financial_data.columns or financial_data['主营业务收入增长率(%)'].isna().all() or
-            '资产负债率(%)' not in financial_data.columns or financial_data['资产负债率(%)'].isna().all()):
+            'pe' not in pe_pb_data.columns or pe_pb_data['pe'].isna().all() or
+            'pb' not in pe_pb_data.columns or pe_pb_data['pb'].isna().all() or
+            '净资产收益率(%)' not in financial_data.columns or financial_data['净资产收益率(%)'].isna().all() or
+            'dividend_yield' not in dividend_data.columns or dividend_data['dividend_yield'].isna().all()):
+            logging.warning(f"股票 {symbol} 数据不完整")
             return pd.DataFrame()
-        
+
         factors = pd.DataFrame(index=stock_data.index)
         financial_data = financial_data.rename(columns=column_mapping)
-        
-        factors['pe'] = pe_pb_data['pe'].fillna(pe_pb_data['pe'].mean()).fillna(20)
-        factors['pb'] = pe_pb_data['pb'].fillna(pe_pb_data['pb'].mean()).fillna(2)
-        factors['roe'] = financial_data['roe'].fillna(financial_data['roe'].mean()).fillna(0)
-        factors['revenue_growth'] = financial_data['revenue_growth'].fillna(financial_data['revenue_growth'].mean()).fillna(0)
-        factors['debt_ratio'] = financial_data['debt_ratio'].fillna(financial_data['debt_ratio'].mean()).fillna(50)
-        
+
+        # 1. 价值因子
+        factors['pe'] = pe_pb_data['pe'].ffill().bfill().fillna(pe_pb_data['pe'].mean()).fillna(20)
+        factors['pb'] = pe_pb_data['pb'].ffill().bfill().fillna(pe_pb_data['pb'].mean()).fillna(2)
+        factors['ps'] = financial_data.get('总收入', stock_data['close'] * 100).div(stock_data['close']).ffill().bfill().fillna(20)
+        factors['dividend_yield'] = dividend_data['dividend_yield'].ffill().bfill().fillna(0)
+
+        # 2. 成长因子
+        factors['roe'] = financial_data['roe'].ffill().bfill().fillna(financial_data['roe'].mean()).fillna(0)
+        factors['revenue_growth'] = financial_data['revenue_growth'].ffill().bfill().fillna(financial_data['revenue_growth'].mean()).fillna(0)
+        factors['net_profit_growth'] = financial_data.get('net_profit_growth', 0).ffill().bfill().fillna(0)
+        factors['asset_growth'] = financial_data.get('asset_growth', 0).ffill().bfill().fillna(0)
+
+        # 3. 动量因子
         factors['short_momentum'] = stock_data['close'].pct_change(20).fillna(0)
+        factors['long_momentum'] = stock_data['close'].pct_change(120).fillna(0)
         factors['reversal'] = -stock_data['close'].pct_change(5).fillna(0)
+
+        # 4. 技术因子
+        factors['rsi'] = pd.Series(talib.RSI(stock_data['close'], timeperiod=14), index=stock_data.index).fillna(50)
+        upper, middle, lower = talib.BBANDS(stock_data['close'], timeperiod=20)
+        factors['bb_width'] = ((upper - lower) / middle).fillna(0)
+        macd, signal, _ = talib.MACD(stock_data['close'], fastperiod=12, slowperiod=26, signalperiod=9)
+        factors['macd_diff'] = (pd.Series(macd, index=stock_data.index) - pd.Series(signal, index=stock_data.index)).fillna(0)
+
+        # 5. 波动率因子
         factors['raw_volatility'] = stock_data['close'].pct_change().rolling(20, min_periods=10).std().fillna(0.1)
         if (factors['raw_volatility'] < 0).any():
+            logging.error(f"股票 {symbol} 包含负原始波动率")
             return pd.DataFrame()
-        factors['volatility'] = factors['raw_volatility']
-        factors['rsi'] = pd.Series(talib.RSI(stock_data['close'], timeperiod=14), index=stock_data.index).fillna(50)
-        factors['low_vol'] = -factors['volatility']
-        
-        factor_columns = ['pe', 'pb', 'roe', 'revenue_growth', 'debt_ratio', 
-                         'short_momentum', 'reversal', 'volatility', 'rsi', 'low_vol']
+        factors['low_vol'] = -factors['raw_volatility']
+        # 特异波动率
+        market_returns = index_data['close'].pct_change().fillna(0)
+        stock_returns = stock_data['close'].pct_change().fillna(0)
+        idio_vol = []
+        for t in stock_data.index:
+            window = pd.DataFrame({
+                'stock': stock_returns.loc[:t].tail(60),
+                'market': market_returns.loc[:t].tail(60)
+            }).dropna()
+            if len(window) < 20:
+                idio_vol.append(0)
+                continue
+            X = sm.add_constant(window['market'])
+            model = sm.OLS(window['stock'], X).fit()
+            residuals = model.resid
+            idio_vol.append(residuals.std())
+        factors['idio_vol'] = pd.Series(idio_vol, index=stock_data.index).fillna(0.1)
+
+        # 6. 质量因子
+        factors['debt_ratio'] = financial_data['debt_ratio'].ffill().bfill().fillna(financial_data['debt_ratio'].mean()).fillna(50)
+        factors['gross_margin'] = financial_data.get('gross_margin', 0).ffill().bfill().fillna(0)
+        factors['wc_turnover'] = financial_data['wc_turnover'].ffill().bfill().fillna(financial_data['wc_turnover'].mean()).fillna(0)
+        factors['cash_flow_to_assets'] = financial_data['cash_flow_to_assets'].ffill().bfill().fillna(financial_data['cash_flow_to_assets'].mean()).fillna(0)
+
+        # 7. 市场因子
+        factors['turnover_rate'] = (stock_data['volume'] / stock_data['volume'].mean()).rolling(20).mean().fillna(0)
+
+        # 因子列表
+        factor_columns = [
+            'pe', 'pb', 'ps', 'dividend_yield',
+            'roe', 'revenue_growth', 'net_profit_growth', 'asset_growth',
+            'short_momentum', 'long_momentum', 'reversal',
+            'rsi', 'bb_width', 'macd_diff',
+            'low_vol', 'idio_vol',
+            'debt_ratio', 'gross_margin', 'wc_turnover', 'cash_flow_to_assets',
+            'turnover_rate'
+        ]
+
+        # 标准化因子
         for col in factor_columns:
             mean = factors[col].mean()
             std = factors[col].std()
             factors[col] = factors[col] - mean if pd.isna(std) or std == 0 else (factors[col] - mean) / std
-        
+
+        # 等权计算 score
         factors['score'] = (
-            -factors['pe'] - factors['pb'] +
-            factors['roe'] + factors['revenue_growth'] -
-            factors['debt_ratio'] +
-            0.5 * factors['short_momentum'] + 0.5 * factors['reversal'] - factors['rsi'] +
-            factors['low_vol']
+            -factors['pe'] - factors['pb'] - factors['ps'] + factors['dividend_yield'] +
+            factors['roe'] + factors['revenue_growth'] + factors['net_profit_growth'] + factors['asset_growth'] +
+            factors['short_momentum'] + factors['long_momentum'] + factors['reversal'] -
+            factors['rsi'] - factors['bb_width'] + factors['macd_diff'] +
+            factors['low_vol'] - factors['idio_vol'] -
+            factors['debt_ratio'] + factors['gross_margin'] + factors['wc_turnover'] + factors['cash_flow_to_assets'] -
+            factors['turnover_rate']
         )
-        factors['score'] = factors['score'].where(factors['volatility'] < factors['volatility'].quantile(0.75), np.nan)
+
+        # 波动率过滤
+        factors['score'] = factors['score'].where(factors['raw_volatility'] < factors['raw_volatility'].quantile(0.75), np.nan)
         factors['symbol'] = symbol
-        
+
         return factors
     except Exception as e:
+        logging.error(f"股票 {symbol} 因子计算失败: {str(e)}")
         return pd.DataFrame()
 
 # 检查因子缓存
@@ -267,7 +416,6 @@ else:
 def select_stocks(factors_dict, rebalance_date, index_weights, alpha=0.5):
     try:
         rebalance_date = pd.Timestamp(rebalance_date)
-        # 直接从预分组的字典中获取数据
         factors = factors_dict.get(rebalance_date)
         if factors is None or factors.empty:
             logging.warning(f"因子数据为空，日期: {rebalance_date}")
@@ -280,31 +428,9 @@ def select_stocks(factors_dict, rebalance_date, index_weights, alpha=0.5):
         index_weights = index_weights[index_weights['日期'] <= rebalance_date].tail(1)
         index_weights_dict = {row['stock_code']: row['权重']/100 for _, row in index_weights.iterrows()}
         
-        factor_weights = {stock: 1.0/num_stocks for stock in selected}
-        
         scores = factors.loc[factors['symbol'].isin(selected), 'score']
         factor_weights = {stock: score / scores.sum() for stock, score in zip(selected, scores)}
         return factor_weights
-    
-        # 向量化计算波动率权重
-        volatilities = factors.loc[factors['symbol'].isin(selected), ['symbol', 'raw_volatility']]
-        volatilities = volatilities.set_index('symbol')['raw_volatility']
-        volatilities = volatilities.where(volatilities > 0, 0.1)
-        final_weights = {}
-        total_weight = 0
-        max_weight = 0.10
-        vol_sum = (1 / volatilities).sum()
-        for stock in selected:
-            index_weight = index_weights_dict.get(stock, 0)
-            factor_weight = factor_weights.get(stock, 0)
-            vol_weight = (1 / volatilities[stock]) / vol_sum
-            weight = (1 - alpha) * index_weight + alpha * vol_weight
-            final_weights[stock] = min(weight, max_weight)
-            total_weight += final_weights[stock]
-        
-        if total_weight > 0:
-            final_weights = {k: v/total_weight for k, v in final_weights.items()}
-        return final_weights
     except Exception as e:
         logging.error(f"选股失败，日期: {rebalance_date}, 错误: {str(e)}")
         return {}
@@ -319,7 +445,6 @@ class IndexEnhanceStrategy(bt.Strategy):
 
     def __init__(self):
         self.all_factors = pd.read_csv("data/all_factors.csv", parse_dates=['date'], index_col='date')
-        # 预分组因子数据
         self.factors_dict = {date: df for date, df in self.all_factors.groupby(self.all_factors.index)}
         self.index_weights = pd.read_csv("data/csi500_weights.csv", parse_dates=['日期'])
         self.weights = {}

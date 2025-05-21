@@ -1,5 +1,6 @@
 data01/
 data/
+data_clean/
 akshare_cache/
 __pychache__/
 *.log
